@@ -1,0 +1,4 @@
+.venv3
+dist/*
+build/*
+*.egg-info
