@@ -57,7 +57,11 @@ warc.write_block(
     # optional fields:
     record_date=datetime.fromisocalendar(2000, 1, 1), # by default it will be set to the current UTC time.
     record_id="urn:custom:i_dont_know", # your record identifier, NOTE: it _must_ be a valid URI. (default: uuid.uuid4().urn)
-    record_meta={"Content-Type": "application/http;msgtype=response"}) # custom meta
+    # You can add custom headers to your block,
+    # Please, try to conform to the IANA's assignments:
+    #   https://www.iana.org/assignments/message-headers/message-headers.xhtml
+    #   https://www.iana.org/assignments/http-fields/http-fields.xhtml
+    record_headers={"Content-Type": "application/http;msgtype=response"}) # custom meta (please try to respect IANA)
 
 # if your object is too big to be in memory
 # you can write it in several calls:

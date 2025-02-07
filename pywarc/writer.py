@@ -51,7 +51,7 @@ class WarcWriter(object):
         self.start_block(record_type, len(content), **kwargs)
         self.write_block_body(content)
 
-    def start_block(self, record_type:str, content_length:int, record_id:[str|None]=None, record_date:[datetime|None]=None, record_meta:dict={}):
+    def start_block(self, record_type:str, content_length:int, record_id:[str|None]=None, record_date:[datetime|None]=None, record_headers:dict={}):
         assert(self.body_remaining_length == 0) # TODO: proper exception
         self.fp.write(b"WARC/1.1\r\n")
         
@@ -64,7 +64,7 @@ class WarcWriter(object):
             "WARC-Type":      record_type,
             "WARC-Record-ID": "<"+record_id+">",
             "WARC-Date":      record_date.isoformat(),
-            **record_meta,
+            **record_headers,
             "Content-Length": content_length})+"\r\n").encode("utf8"))
         
         self.body_remaining_length = content_length
