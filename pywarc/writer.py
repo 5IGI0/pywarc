@@ -45,7 +45,7 @@ class WarcWriter(object):
                 **DEFAULT_META,
                 **warc_meta}
             encoded_meta = _serialize_dict(actual_meta).encode("utf8")
-            self.write_block("warcinfo", encoded_meta, record_meta={"Content-Type": "application/warc-fields"})
+            self.write_block("warcinfo", encoded_meta, record_headers={"Content-Type": "application/warc-fields"})
 
     def write_block(self, record_type: str, content: bytes, **kwargs):
         self.start_block(record_type, len(content), **kwargs)
