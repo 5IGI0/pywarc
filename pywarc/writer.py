@@ -32,7 +32,7 @@ def _serialize_dict(d: dict) -> str:
 class WarcWriter(object):
     def __init__(self, file:[str|BytesIO], truncate=False, warc_meta={}, software_name="unknown", software_version="unkown"):
         if isinstance(file, str):
-            self.fp = open(file, "ab+")
+            self.fp = open(file, "ab" if truncate == False else "wb")
         else:
             self.fp = file
 
