@@ -1,8 +1,9 @@
 from setuptools import setup, find_packages
+from pywarc.constants import PY_WARC_VERSION
 
 setup(
     name="pywarc",
-    version="0.1.0",
+    version=PY_WARC_VERSION,
     packages=find_packages(),
     install_requires=[],
     author="5IGI0",
