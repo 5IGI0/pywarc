@@ -14,22 +14,27 @@ blk = warc.get_next_block() # read a block
 print(blk.content_length) # get content length
 print(blk.headers)        # read headers
 print(blk.read(10))       # read x bytes
-print(blk.read())         # read everything
+print(blk.read())         # read every next bytes
 
 blk = warc.get_next_block() # read next block
 # note that you won't be able to read the previous block anymore
 # if the file is not seekable.
 
 print(blk.content_length) # get content length
-print(blk.headers)        # read headers
+# read WARC headers
+print(blk.type)
+print(blk.date) # will return a datetime
+print(blk.content_type) # str or None
+print(blk.record_id)
+print(blk.warcinfo_id)
 
 # you can also get the content as a stream
-stream = blk.get_as_stream()
+stream = blk.get_as_stream() # NOTE: it will read the whole block, do not do that to read big files
 print(stream.readline()) # for easier manipulation
 
 # or you can even use a for loop to iterate on each blocks
 for blk in warc:
-    print(blk.headers["WARC-Record-ID"])
+    print(blk.record_id)
 ```
 
 How to write a warc file:
@@ -57,11 +62,7 @@ warc.write_block(
     # optional fields:
     record_date=datetime.fromisocalendar(2000, 1, 1), # by default it will be set to the current UTC time.
     record_id="urn:custom:i_dont_know", # your record identifier, NOTE: it _must_ be a valid URI. (default: uuid.uuid4().urn)
-    # You can add custom headers to your block,
-    # Please, try to conform to the IANA's assignments:
-    #   https://www.iana.org/assignments/message-headers/message-headers.xhtml
-    #   https://www.iana.org/assignments/http-fields/http-fields.xhtml
-    record_headers={"Content-Type": "application/http;msgtype=response"}) # custom meta (please try to respect IANA)
+    record_headers={"Content-Type": "application/http;msgtype=response"})
 
 # if your object is too big to be in memory
 # you can write it in several calls:

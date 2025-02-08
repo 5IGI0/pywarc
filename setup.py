@@ -4,7 +4,7 @@ from pywarc.constants import PY_WARC_VERSION
 setup(
     name="pywarc",
     version=PY_WARC_VERSION,
-    packages=find_packages(),
+    packages=["pywarc"],
     install_requires=[],
     author="5IGI0",
     author_email="5IGI0@protonmail.com",

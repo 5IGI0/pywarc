@@ -12,6 +12,21 @@
 # See the GNU Lesser General Public License for more details.
 #
 # You should have received a copy of the GNU Lesser General Public License along with PyWarc.
-# If not, see <https://www.gnu.org/licenses/>. 
+# If not, see <https://www.gnu.org/licenses/>.
 
-PY_WARC_VERSION="0.2.0"
+from io import BytesIO
+
+def patch_BytesIo(seekable):
+    class PatchedByteIO(BytesIO):
+        def seekable(self):
+            return seekable
+
+        def seek(self, *args, **kwargs):
+            if seekable:
+                return super().seek(*args, **kwargs)
+            else:
+                raise Exception("shouldn't have use seek() on non-seekable file")
+
+        def force_seek(self, *args, **kwargs):
+            return super().seek(*args, **kwargs)
+    return PatchedByteIO

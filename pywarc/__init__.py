@@ -14,5 +14,5 @@
 # You should have received a copy of the GNU Lesser General Public License along with PyWarc.
 # If not, see <https://www.gnu.org/licenses/>. 
 
-from .reader import WarcReader
-from .writer import WarcWriter
+from .reader import WarcReader, InvalidWarcError, MissingWarcHeaderError, WarcHeaderBadValueError, NotSeekableError
+from .writer import WarcWriter, PreviousBlockNotTerminatedError, CurrentBlockOverflowError
