@@ -19,6 +19,7 @@ from datetime import datetime
 from uuid import uuid4
 
 from .constants import PY_WARC_VERSION
+from .compression import SeekableGZipWriter, FakeSeekableWriter, MakeFakeTellable
 
 DEFAULT_META={
     "format": "WARC File Format 1.1",
@@ -36,14 +37,27 @@ class CurrentBlockOverflowError(Exception):
     pass
 
 class WarcWriter(object):
-    def __init__(self, file:[str|BytesIO], truncate=False, warc_meta={}, software_name="unknown", software_version="unkown"):
+    def __init__(
+        self, file:[str|BytesIO],
+        truncate=False, warc_meta={},
+        software_name="unknown", software_version="unkown",
+        compress:[bool|None]=None, uncompress_pos:int=0
+    ):
         if isinstance(file, str):
             self.is_fp_self_managed = True
             self.fp = open(file, "ab" if truncate == False else "wb")
+            if compress is None and file.endswith(".gz"):
+                compress = True # if compression is not provided and it ends with .gz, then enable it
         else:
             self.is_fp_self_managed = False
             self.fp = file
 
+        if compress:
+            self.fp = MakeFakeTellable(SeekableGZipWriter(self.fp))
+        else:
+            self.fp = MakeFakeTellable(FakeSeekableWriter(self.fp))
+
+        self.uncompress_pos = uncompress_pos
         self.warc_info_id = uuid4().urn
         # how many bytes we are waiting to complete the current block
         self.body_remaining_length = 0
@@ -56,12 +70,17 @@ class WarcWriter(object):
         self.write_block("warcinfo", encoded_meta, record_id=self.warc_info_id, record_headers={"Content-Type": "application/warc-fields"})
 
     def write_block(self, record_type: str, content: bytes, **kwargs):
-        self.start_block(record_type, len(content), **kwargs)
+        ret = self.start_block(record_type, len(content), **kwargs)
         self.write_block_body(content)
+        return ret
 
-    def start_block(self, record_type:str, content_length:int, record_id:[str|None]=None, record_date:[datetime|None]=None, record_headers:dict={}):
+    def start_block(self, record_type:str, content_length:int, record_id:[str|None]=None, record_date:[datetime|None]=None, record_headers:dict={}) -> (int, int):
         if self.body_remaining_length != 0:
             raise PreviousBlockNotTerminatedError(f"previous blocks not terminated: {self.body_remaining_length} bytes missing")
+        
+        uncompress_pos = self.fp.tell()
+        compress_pos = self.fp.start_part()
+
         self.fp.write(b"WARC/1.1\r\n")
         
         if record_id is None:
@@ -80,6 +99,9 @@ class WarcWriter(object):
         self.body_remaining_length = content_length
         if content_length == 0:
             self.fp.write(b"\r\n\r\n")
+            self.fp.end_part()
+
+        return (uncompress_pos+self.uncompress_pos, compress_pos)
 
     def write_block_body(self, content:bytes):
         if len(content) == 0:
@@ -90,6 +112,7 @@ class WarcWriter(object):
         self.body_remaining_length -= len(content)
         if self.body_remaining_length == 0:
             self.fp.write(b"\r\n\r\n")
+            self.fp.end_part()
 
     def flush(self):
         self.fp.flush()

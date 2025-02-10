@@ -16,6 +16,7 @@
 
 from io import BytesIO
 from datetime import datetime
+import gzip
 
 MAX_SKIPBUF = 4096
 
@@ -79,19 +80,29 @@ class WarcBlock(object):
     warcinfo_id=property(_get_header("WARC-Warcinfo-ID", False, _url_header_sanitizer))
 
 class WarcReader(object):
-    def __init__(self, file:[str|BytesIO]):
+    def __init__(self, file:[str|BytesIO], compressed=None):
+        self.fp = None
         if isinstance(file, str):
             self.is_fp_self_managed = True
             self.fp = open(file, "rb")
+            if compressed is None and file.endswith(".gz"):
+                compressed = True
         else:
             self.is_fp_self_managed = False
             self.fp = file
+
+        # Gzip python API assume the underlying file is seekable
+        # So we need to check the seekableness before sending it to gzip
         self.is_seekable = self.fp.seekable()
+        if compressed:
+            self.fp = gzip.GzipFile(fileobj=self.fp)
+        
         if self.is_seekable:
             self.current_pos = self.fp.tell()
         else:
             self.current_pos = 0
         self.next_block = self.current_pos
+        
 
     def get_next_block(self):
         headers = b""
@@ -167,5 +178,5 @@ class WarcReader(object):
         return self
 
     def __del__(self):
-        if self.is_fp_self_managed:
+        if self.is_fp_self_managed and self.fp is not None:
             self.fp.close()

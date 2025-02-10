@@ -65,10 +65,12 @@ class WriterTester(unittest.TestCase):
         for _ in reader:
             pass
 
-def gen_tester(name, PatchedBytesIO):
+def gen_tester(name, PatchedBytesIO, compress):
     class WriterTester(unittest.TestCase):
         @classmethod
         def setUpClass(cls):
+            cls.compress = compress
+
             cls.warcinfo = {
                         os.urandom(randint(1, 10)).hex(): os.urandom(randint(1, 10)).hex()
                         for _ in range(5)}
@@ -119,7 +121,7 @@ def gen_tester(name, PatchedBytesIO):
 
         def validate_warc(self, fp):
             with self.subTest("validate archive"):
-                reader = WarcReader(fp)
+                reader = WarcReader(fp, compressed=self.compress)
 
                 first_block = reader.get_next_block()
                 self.assertEqual(first_block.type, "warcinfo")
@@ -132,7 +134,7 @@ def gen_tester(name, PatchedBytesIO):
 
         def check_content(self, fp):
             with self.subTest("check content"):
-                reader = WarcReader(fp)
+                reader = WarcReader(fp, compressed=self.compress)
 
                 first_block = reader.get_next_block()
                 with self.subTest("check that users' fields are present"):
@@ -164,28 +166,30 @@ def gen_tester(name, PatchedBytesIO):
                         self.assertTrue(v, msg=f"'{k}' is not present in the block header")
 
         def test_write_block(self):
-            underlaying_fp = PatchedBytesIO(b"")
+            underlying_fp = PatchedBytesIO(b"")
             writer = WarcWriter(
-                underlaying_fp,
+                underlying_fp,
                 software_name="unittester",
                 software_version="0.0.0",
-                warc_meta=self.warcinfo)
+                warc_meta=self.warcinfo,
+                compress=self.compress)
 
             for block in self.testset:
                 writer.write_block("resource", block["content"], record_headers=block["custom_headers"])
             
-            underlaying_fp.force_seek(0) # do not use it in your code to bypass the tests.
-            self.validate_warc(underlaying_fp)
-            underlaying_fp.force_seek(0) # do not use it in your code to bypass the tests.
-            self.check_content(underlaying_fp)
+            underlying_fp.force_seek(0) # do not use it in your code to bypass the tests.
+            self.validate_warc(underlying_fp)
+            underlying_fp.force_seek(0) # do not use it in your code to bypass the tests.
+            self.check_content(underlying_fp)
         
         def test_write_chunked_block(self):
-            underlaying_fp = PatchedBytesIO(b"")
+            underlying_fp = PatchedBytesIO(b"")
             writer = WarcWriter(
-                underlaying_fp,
+                underlying_fp,
                 software_name="unittester",
                 software_version="0.0.0",
-                warc_meta=self.warcinfo)
+                warc_meta=self.warcinfo,
+                compress=self.compress)
 
             for block in self.testset:
                 writer.start_block("resource", len(block["content"]), record_headers=block["custom_headers"])
@@ -198,18 +202,19 @@ def gen_tester(name, PatchedBytesIO):
                     curoff+=part_size
                 writer.write_block_body(b"")
             
-            underlaying_fp.force_seek(0) # do not use it in your code to bypass the tests.
-            self.validate_warc(underlaying_fp)
-            underlaying_fp.force_seek(0) # do not use it in your code to bypass the tests.
-            self.check_content(underlaying_fp)
+            underlying_fp.force_seek(0) # do not use it in your code to bypass the tests.
+            self.validate_warc(underlying_fp)
+            underlying_fp.force_seek(0) # do not use it in your code to bypass the tests.
+            self.check_content(underlying_fp)
 
         def test_overflow_and_not_terminated(self):
-            underlaying_fp = PatchedBytesIO(b"")
+            underlying_fp = PatchedBytesIO(b"")
             writer = WarcWriter(
-                underlaying_fp,
+                underlying_fp,
                 software_name="unittester",
                 software_version="0.0.0",
-                warc_meta=self.warcinfo)
+                warc_meta=self.warcinfo,
+                compress=self.compress)
 
             self.assertRaises(CurrentBlockOverflowError, lambda: writer.write_block_body(b"rtdffg"))
 
@@ -224,5 +229,7 @@ def gen_tester(name, PatchedBytesIO):
     WriterTester.__qualname__ = name
     return WriterTester
     
-SeekableWriterTester = gen_tester("SeekableWriteTester", patch_BytesIo(True))
-NotSeekableWriterTester = gen_tester("NonSeekableWriteTester", patch_BytesIo(False))
+SeekableWriterTester = gen_tester("SeekableWriteTester", patch_BytesIo(True), False)
+NotSeekableWriterTester = gen_tester("NonSeekableWriteTester", patch_BytesIo(False), False)
+CompressedSeekableWriteTester = gen_tester("CompressedSeekableWriteTester", patch_BytesIo(True), True)
+CompressedNonSeekableWriteTester = gen_tester("CompressedNonSeekableWriteTester", patch_BytesIo(False), True)

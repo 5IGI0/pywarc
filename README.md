@@ -6,7 +6,10 @@ How to read a warc file:
 ```python
 from pywarc import WarcReader
 
-warc = WarcReader("my_archive.warc")
+
+# if the suffix .gz is present, then it will compress
+# but you can also overwrite it with compressed=True or compressed=False
+warc = WarcReader("my_archive.warc.gz")
 # you can also provide your own fp
 # warc = WarcReader(sys.stdin.buffer)
 blk = warc.get_next_block() # read a block
@@ -48,6 +51,8 @@ import os
 
 # but you have more options:
 warc = WarcWriter(
+    # if the suffix .gz is present, then it will compress
+    # but you can also overwrite it with compress=True or compress=False
     "my_archive.warc",
     truncate=True, # by default it will appends, but you can choose to truncate it.
     software_name="my_program",
@@ -56,9 +61,16 @@ warc = WarcWriter(
         "My-Super-Meta": "Hello, World!", # you can set meta to the warcinfo's block.
         "conformsTo": None})              # or delete default ones with None.
 
+# returns a tuple: (<uncompressed_pos>,<compressed_pos>)
+#
+# compressed_pos can be used to seek before opening it with reader
+# to retrieve the wanted record without uncompressing previous records.
+#
+# NOTE: uncompressed_pos is per instance, so if you open in append mode, it will be relative from this location.
+# if you know the current position before opening, you can use uncompress_pos=... in the constructor
 warc.write_block(
     "response",
-    b"HTTP/1.1 200 OK\r\nHost: example.com\r\nContent-Type: 0\r\n\r\n",
+    b"HTTP/1.1 200 OK\r\nHost: example.com\r\nContent-Length: 0\r\n\r\n",
     # optional fields:
     record_date=datetime.fromisocalendar(2000, 1, 1), # by default it will be set to the current UTC time.
     record_id="urn:custom:i_dont_know", # your record identifier, NOTE: it _must_ be a valid URI. (default: uuid.uuid4().urn)
@@ -74,7 +86,7 @@ with open("hypothetical_file.txt", "rb") as fp:
     # please note that this implies that if an error occurs at this point,
     # the archive will be truncated and so if you reopen this file for writing,
     # all subsequent data will be corrupted.
-    warc.start_block("my_custom_type", size)
+    warc.start_block("my_custom_type", size) # returns the same values as write_block()
     for l in fp:
         warc.write_block_body(l)
 ```

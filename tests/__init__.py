@@ -14,5 +14,5 @@
 # You should have received a copy of the GNU Lesser General Public License along with PyWarc.
 # If not, see <https://www.gnu.org/licenses/>. 
 
-from .WriterTesters import SeekableWriterTester, NotSeekableWriterTester, WriterTester
-from .ReaderTesters import ReaderTester, SeekableReaderTester, NonSeekableReaderTester
+from .WriterTesters import SeekableWriterTester, NotSeekableWriterTester, WriterTester, CompressedSeekableWriteTester, CompressedNonSeekableWriteTester
+from .ReaderTesters import ReaderTester, SeekableReaderTester, NonSeekableReaderTester, GzipReaderTester, GzipSeekableReaderTester, GzipNonSeekableReaderTester
