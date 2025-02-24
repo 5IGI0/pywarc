@@ -14,4 +14,4 @@
 # You should have received a copy of the GNU Lesser General Public License along with PyWarc.
 # If not, see <https://www.gnu.org/licenses/>. 
 
-PY_WARC_VERSION="0.3.0"
+PY_WARC_VERSION="0.3.1"
