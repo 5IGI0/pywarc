@@ -16,3 +16,4 @@
 
 from .WriterTesters import SeekableWriterTester, NotSeekableWriterTester, WriterTester, CompressedSeekableWriteTester, CompressedNonSeekableWriteTester
 from .ReaderTesters import ReaderTester, SeekableReaderTester, NonSeekableReaderTester, GzipReaderTester, GzipSeekableReaderTester, GzipNonSeekableReaderTester
+from .RecordTesters import RecordTester

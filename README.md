@@ -7,7 +7,7 @@ How to read a warc file:
 from pywarc import WarcReader
 
 
-# if the suffix .gz is present, then it will compress
+# if the suffix .gz is present, then it will decompress
 # but you can also overwrite it with compressed=True or compressed=False
 warc = WarcReader("my_archive.warc.gz")
 # you can also provide your own fp
@@ -39,6 +39,44 @@ print(stream.readline()) # for easier manipulation
 for blk in warc:
     print(blk.record_id)
 ```
+
+Header access (names are case-insensitive, repeated headers are supported):
+```python
+blk.header("Content-Type")           # first value or None (or a default: blk.header("X", "dflt"))
+blk.header_all("WARC-Concurrent-To") # list of every value, in record order
+blk.headers                          # {name as written: [values]}
+blk.version                          # "WARC/1.0" or "WARC/1.1"
+blk.target_uri, blk.payload_digest, blk.block_digest
+blk.refers_to, blk.concurrent_to     # <> stripped; concurrent_to is a list
+```
+
+Readers are context managers (`with WarcReader(path) as warc:`); `close()` closes
+what the reader opened itself (never a stream you passed in). Both `WARC/1.0` and
+`WARC/1.1` records are read. The reader is strict: truncated input raises
+`TruncatedWarcError` (a subclass of `InvalidWarcError`), other malformed input
+`InvalidWarcError`; the head is bounded by `max_header_bytes` (default 64 KiB)
+and `max_headers` (default 1024), and the `\r\n\r\n` record trailer is checked.
+
+Parse a single record held in memory, or stream one from a non-seekable source
+such as an HTTP response (the body is never buffered by the reader):
+```python
+from pywarc import parse_record, WarcReader
+
+blk = parse_record(data)  # exactly one uncompressed record, else InvalidWarcError
+
+blk = WarcReader(response).get_next_block()   # e.g. http.client.HTTPResponse
+while True:
+    chunk = blk.read(65536)
+    if not chunk:
+        break
+    ...
+```
+
+Dates: `blk.date` is always a timezone-aware UTC `datetime`. All WARC profiles are
+accepted (`YYYY`, `YYYY-MM`, `YYYY-MM-DD`, or a time part with `Z`/`+hh:mm`);
+a time without a time zone designator raises `WarcHeaderBadValueError`.
+`format_warc_date(d)` writes `YYYY-MM-DDThh:mm:ssZ` (naive datetimes are assumed
+to be UTC, aware ones are converted).
 
 How to write a warc file:
 ```python
@@ -90,3 +128,79 @@ with open("hypothetical_file.txt", "rb") as fp:
     for l in fp:
         warc.write_block_body(l)
 ```
+
+Writer options and context manager:
+```python
+# no warcinfo record (and no WARC-Warcinfo-ID header on records)
+with WarcWriter("my_archive.warc", write_warcinfo=False) as warc:
+    warc.write_block("resource", b"data")
+```
+`record_id` / `record_headers` are validated (`ValueError`) before anything is
+written. `record_headers` values may be a string, a list/tuple (one line per
+value) or `None` (skipped). `record_id` may be given with or without `<>`.
+Naive `record_date` values are assumed to be UTC.
+
+Serialize a single record without a file (always WARC/1.1, no warcinfo):
+```python
+from pywarc import serialize_record, serialize_record_head, iter_serialized_record
+
+data = serialize_record("resource", b"abc", record_id="urn:x:1",
+                        record_headers={"WARC-Target-URI": "http://e.x/"})
+
+# large bodies: stream head, body chunks and trailer (e.g. as a chunked HTTP
+# request body). Raises ContentLengthMismatchError if the body length differs.
+with open("big.bin", "rb") as fp:
+    for chunk in iter_serialized_record("resource", size, fp, chunk_size=65536):
+        send(chunk)
+```
+`WARC-Type`, `WARC-Record-ID`, `WARC-Date` and `Content-Length` are managed and
+cannot be given in `record_headers`.
+
+## Tests
+
+```sh
+python3 -m unittest   # from the repository root
+```
+
+## Changes in 0.4.0
+
+New: `parse_record`, `serialize_record`, `serialize_record_head`,
+`iter_serialized_record`, `parse_warc_date`, `format_warc_date`, `WarcBlock.header`,
+`header_all`, `version`, `target_uri`, `payload_digest`, `block_digest`,
+`refers_to`, `concurrent_to`, `TruncatedWarcError`, `ContentLengthMismatchError`,
+`write_warcinfo=False`, context managers, `max_header_bytes` / `max_headers`,
+non-seekable streams without a `seekable()` method. `python_requires>=3.7` is now true.
+
+Behaviour changes (bug fixes):
+- repeated headers give lists of all values (were `None` / crash on the third);
+- header names are case-insensitive in getters and `header()`; `blk.headers` keeps names as written;
+- `Name:value` (no space), surrounding whitespace and folded lines are accepted;
+  values are stripped of leading/trailing SP/HT;
+- `WARC/1.0` records are readable;
+- non-canonical, negative or duplicate `Content-Length`, invalid UTF-8 headers,
+  oversize heads, missing trailers and truncated records raise
+  `InvalidWarcError` / `TruncatedWarcError` instead of yielding garbage or short reads;
+- `blk.date` is always tz-aware UTC; a time without a TZD raises `WarcHeaderBadValueError`
+  (before: naive datetime on 3.11, crash before 3.11 for `Z`);
+- writer: aware datetimes are converted to UTC (was an invalid `+00:00Z`);
+  `record_headers` duplicating a managed header or containing CR/LF/control
+  characters raise `ValueError` (before: invalid output / header injection);
+  `warc_meta` values are checked too;
+- a garbage-collected compressed `WarcWriter` no longer closes the caller's file;
+- the raw file of a `.gz` path opened by `WarcReader` is closed.
+- `record_id` / `warcinfo_id` are validated: an id without `:`, or containing a
+  space, `<` or `>`, raises `ValueError` (0.3.x accepted anything); `"<x>"` no
+  longer becomes `<<x>>`;
+- `record_type` must be an RFC 9110 token (`"my type"` raises `ValueError`);
+- list/tuple values in `record_headers` emit one line per value (0.3.x wrote `str(list)`);
+- `content_length` must be an `int` in `[0, 2**64-1]` (no bool, float or numpy int);
+- the `WarcReader.next_block` attribute is gone (internal state is now private);
+- a version line cut by EOF raises `TruncatedWarcError`.
+
+Strictness notes: the reader accepts control bytes in header values, but the
+writer rejects them. `concurrent_to` is lenient about `<>` (stripped if present)
+while `refers_to`, `record_id` and `warcinfo_id` require them.
+
+Masstuffy server limits that matter for clients: at most 256 headers, 64 KiB of
+headers and (by default) 1 GiB of body per record. The writer does not enforce
+them; the reader's defaults are `max_headers=1024`, `max_header_bytes=64 KiB`.

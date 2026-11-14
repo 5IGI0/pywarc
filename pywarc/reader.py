@@ -14,169 +14,347 @@
 # You should have received a copy of the GNU Lesser General Public License along with PyWarc.
 # If not, see <https://www.gnu.org/licenses/>. 
 
-from io import BytesIO
-from datetime import datetime
+from __future__ import annotations
+
 import gzip
+from datetime import datetime
+from io import BytesIO
+from typing import IO, Callable, Dict, List, Optional, Union
+
+from ._headers import is_token, parse_content_length, parse_warc_date, strip_brackets
+from .errors import (  # noqa: F401  (re-exported for backward compatibility)
+    InvalidWarcError,
+    MissingWarcHeaderError,
+    NotSeekableError,
+    TruncatedWarcError,
+    WarcHeaderBadValueError,
+)
 
 MAX_SKIPBUF = 4096
+DEFAULT_MAX_HEADER_BYTES = 64 * 1024
+DEFAULT_MAX_HEADERS = 1024
 
-class InvalidWarcError(Exception):
-    pass
+_VERSIONS = {b"WARC/1.0\r\n": "WARC/1.0", b"WARC/1.1\r\n": "WARC/1.1"}
+_TRAILER = b"\r\n\r\n"
 
-class MissingWarcHeaderError(InvalidWarcError):
-    pass
 
-class WarcHeaderBadValueError(InvalidWarcError):
-    pass
+def _url_header_sanitizer(header: str) -> str:
+    if len(header) < 2 or header[0] != "<" or header[-1] != ">":
+        raise ValueError("expected a value between '<' and '>'")
+    return header[1:-1]
 
-class NotSeekableError(Exception):
-    pass
 
-def _get_header(header, is_mandatory, sanitize=lambda x: str(x)):
+def _get_header(header: str, is_mandatory: bool, sanitize: Callable[[str], object] = str):
     def header_getter(self):
-        try:
-            val = self.headers[header][0]
-        except KeyError:
+        val = self.header(header)
+        if val is None:
             if is_mandatory:
                 raise MissingWarcHeaderError(f"header '{header}' not present")
-            else:
-                return None
-        
+            return None
         try:
             return sanitize(val)
         except Exception as e:
-            raise WarcHeaderBadValueError(f"'{header}' contains an invalid value")
+            raise WarcHeaderBadValueError(f"'{header}' contains an invalid value") from e
     return header_getter
 
-def _url_header_sanitizer(header):
-    assert(header[0] == '<' and header[-1] == '>')
-    return header[1:-1]
+
+def _concurrent_to(self) -> List[str]:
+    return [strip_brackets(v) for v in self.header_all("WARC-Concurrent-To")]
+
 
 class WarcBlock(object):
-    def __init__(self, warc_reader, headers, block_content_pos):
+    """One WARC record: its headers and a lazy view on its body."""
+
+    def __init__(self, warc_reader: "WarcReader", headers: Dict[str, List[str]],
+                 block_content_pos: int, version: str = "WARC/1.1",
+                 lower: Optional[Dict[str, List[str]]] = None) -> None:
         self.warc_reader = warc_reader
         self.block_content_pos = block_content_pos
         self.read_offset = 0
         self.headers = headers
-        self.content_length = int(headers["Content-Length"][0])
-    
-    def read(self, nread=None):
+        self.version = version
+        if lower is None:
+            lower = {}
+            for k, vs in headers.items():
+                lower.setdefault(k.lower(), []).extend(vs)
+        self._lower: Dict[str, List[str]] = lower
+        cl = self.header("Content-Length")
+        if cl is None:
+            raise InvalidWarcError("current record doesn't have 'Content-Length' header")
+        self.content_length = parse_content_length(cl)
+
+    def header(self, name: str, default: Optional[str] = None) -> Optional[str]:
+        """First value of header `name` (case-insensitive), or `default`."""
+        vs = self._lower.get(name.lower())
+        return vs[0] if vs else default
+
+    def header_all(self, name: str) -> List[str]:
+        """All values of header `name` in record order (case-insensitive); [] if absent."""
+        return list(self._lower.get(name.lower(), ()))
+
+    def read(self, nread: Optional[int] = None) -> bytes:
+        """Read up to `nread` body bytes (all remaining if None).
+
+        Raises TruncatedWarcError if the input ends before the declared body does.
+        """
         unread_data = self.content_length - self.read_offset
 
-        if nread is None or nread > unread_data:
-            nread = unread_data 
+        if nread is None or nread < 0 or nread > unread_data:
+            nread = unread_data
 
         ret = self.warc_reader.read_at(nread, self.block_content_pos + self.read_offset)
         self.read_offset += len(ret)
+        if len(ret) < nread:
+            raise TruncatedWarcError("record body is truncated")
         return ret
 
-    def get_as_stream(self):
-        return BytesIO(self.warc_reader.read_at(self.content_length, self.block_content_pos))
+    def get_as_stream(self) -> BytesIO:
+        """The whole body as a BytesIO (slurps the body)."""
+        ret = self.warc_reader.read_at(self.content_length, self.block_content_pos)
+        if len(ret) < self.content_length:
+            raise TruncatedWarcError("record body is truncated")
+        return BytesIO(ret)
 
-    type=property(_get_header("WARC-Type", True))
-    date=property(_get_header("WARC-Date", True, datetime.fromisoformat))
-    content_type=property(_get_header("Content-Type", False))
-    record_id=property(_get_header("WARC-Record-ID", True, _url_header_sanitizer))
-    warcinfo_id=property(_get_header("WARC-Warcinfo-ID", False, _url_header_sanitizer))
+    type = property(_get_header("WARC-Type", True))
+    date = property(_get_header("WARC-Date", True, parse_warc_date))
+    content_type = property(_get_header("Content-Type", False))
+    record_id = property(_get_header("WARC-Record-ID", True, _url_header_sanitizer))
+    warcinfo_id = property(_get_header("WARC-Warcinfo-ID", False, _url_header_sanitizer))
+    target_uri = property(_get_header("WARC-Target-URI", False, strip_brackets))
+    payload_digest = property(_get_header("WARC-Payload-Digest", False))
+    block_digest = property(_get_header("WARC-Block-Digest", False))
+    refers_to = property(_get_header("WARC-Refers-To", False, _url_header_sanitizer))
+    concurrent_to = property(_concurrent_to)
+
 
 class WarcReader(object):
-    def __init__(self, file:[str|BytesIO], compressed=None):
+    """Reads WARC/1.0 and WARC/1.1 records from a path or a binary stream.
+
+    The stream may be non-seekable (e.g. an HTTP response); then only the
+    current record can be read. `close()` closes what the reader opened itself
+    (the file opened from a path and the gzip wrapper), never a stream you
+    passed in.
+    """
+
+    def __init__(self, file: Union[str, IO[bytes]], compressed: Optional[bool] = None,
+                 *, max_header_bytes: int = DEFAULT_MAX_HEADER_BYTES,
+                 max_headers: int = DEFAULT_MAX_HEADERS) -> None:
         self.fp = None
+        self._raw_fp = None
+        self._gzip_fp = None
+        self.max_header_bytes = max_header_bytes
+        self.max_headers = max_headers
         if isinstance(file, str):
             self.is_fp_self_managed = True
-            self.fp = open(file, "rb")
+            self._raw_fp = open(file, "rb")
+            raw = self._raw_fp
             if compressed is None and file.endswith(".gz"):
                 compressed = True
         else:
             self.is_fp_self_managed = False
-            self.fp = file
+            raw = file
+        self.fp = raw
 
         # Gzip python API assume the underlying file is seekable
-        # So we need to check the seekableness before sending it to gzip
-        self.is_seekable = self.fp.seekable()
-        if compressed:
-            self.fp = gzip.GzipFile(fileobj=self.fp)
-        
-        if self.is_seekable:
-            self.current_pos = self.fp.tell()
-        else:
-            self.current_pos = 0
-        self.next_block = self.current_pos
-        
+        # So we need to check the seekableness before sending it to gzip
+        try:
+            self.is_seekable = bool(getattr(raw, "seekable", lambda: False)())
+            if compressed:
+                self._gzip_fp = gzip.GzipFile(fileobj=raw)
+                self.fp = self._gzip_fp
 
-    def get_next_block(self):
-        headers = b""
+            self.current_pos = self.fp.tell() if self.is_seekable else 0
+        except BaseException:
+            self.close()
+            raise
+        self._prev_body_end: Optional[int] = None
 
-        self.skip_to(self.next_block)
+    # internal I/O (all of them keep current_pos in sync with the stream)
 
+    def _readline(self, limit: int) -> bytes:
+        line = self.fp.readline(limit)
+        self.current_pos += len(line)
+        return line
+
+    def _read_exact(self, n: int) -> bytes:
+        chunks = []
+        got = 0
+        while got < n:
+            chunk = self.fp.read(n - got)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            got += len(chunk)
+        self.current_pos += got
+        return chunks[0] if len(chunks) == 1 else b"".join(chunks)
+
+    def get_next_block(self) -> Optional[WarcBlock]:
+        """Return the next record, or None at a clean end of input.
+
+        Raises InvalidWarcError (malformed) or TruncatedWarcError (cut input).
+        """
+        if self._prev_body_end is not None:
+            self.skip_to(self._prev_body_end)
+            trailer = self._read_exact(4)
+            if len(trailer) < 4:
+                raise TruncatedWarcError("record trailer is truncated")
+            if trailer != _TRAILER:
+                raise InvalidWarcError("missing record trailer")
+            self._prev_body_end = None
+
+        limit = self.max_header_bytes
+        line = self._readline(limit + 1)
+        if line == b"":
+            return None
+        if line not in _VERSIONS:
+            if not line.endswith(b"\n") and any(v.startswith(line) for v in _VERSIONS):
+                raise TruncatedWarcError("record version line is truncated")
+            raise InvalidWarcError(f"invalid WARC header: {line[:64]!r}")
+        version = _VERSIONS[line]
+        used = len(line)
+
+        entries: List[List[bytes]] = []
         while True:
-            tmp = self.fp.readline()
-
-            if headers == b"" and tmp == b"": # no block anymore
-                return None
-
-            if headers == b"" and tmp != b"WARC/1.1\r\n":
-                raise InvalidWarcError(f"invalid WARC header: {tmp}")
-
-            headers += tmp
-            if tmp == b"\r\n" or tmp == b"":
+            remaining = limit - used
+            line = self._readline(remaining + 1)
+            if len(line) > remaining:
+                raise InvalidWarcError("header section too large")
+            used += len(line)
+            if not line.endswith(b"\n"):
+                raise TruncatedWarcError("record head is truncated")
+            if not line.endswith(b"\r\n"):
+                raise InvalidWarcError("header line not terminated by CRLF")
+            if line == b"\r\n":
                 break
+            line = line[:-2]
+            if line.startswith((b" ", b"\t")):
+                if not entries:
+                    raise InvalidWarcError("continuation line without a header")
+                prev = entries[-1][1]
+                cont = line.strip(b" \t")
+                entries[-1][1] = (prev + b" " + cont) if prev.strip(b" \t") else cont
+                continue
+            name, sep, value = line.partition(b":")
+            if not sep:
+                raise InvalidWarcError(f"invalid WARC header: {line[:64]!r}")
+            if len(entries) >= self.max_headers:
+                raise InvalidWarcError("too many headers")
+            entries.append([name, value])
 
-        self.current_pos += len(headers)
-        headers_dict = {}
-        for header in  headers.splitlines()[1:]:
-            if header == b"":
-                break
-            shdr = header.split(b": ")
-            if len(shdr) == 1:
-                raise InvalidWarcError(f"invalid WARC header: {header}")
-            k = shdr[0].decode()
-            v = (b": ".join(shdr[1:])).decode()
-            headers_dict[k] = headers_dict[k].append(v) if k in headers_dict else [v]
+        headers: Dict[str, List[str]] = {}
+        lower: Dict[str, List[str]] = {}
+        for name_b, value_b in entries:
+            try:
+                name = name_b.decode("ascii")
+            except UnicodeDecodeError as e:
+                raise InvalidWarcError(f"invalid header name: {name_b[:64]!r}") from e
+            if not is_token(name):
+                raise InvalidWarcError(f"invalid header name: {name!r}")
+            try:
+                value = value_b.strip(b" \t").decode("utf-8")
+            except UnicodeDecodeError as e:
+                raise InvalidWarcError(f"header '{name}' is not valid UTF-8") from e
+            headers.setdefault(name, []).append(value)
+            lower.setdefault(name.lower(), []).append(value)
 
-        if not "Content-Length" in headers_dict:
-            raise InvalidWarcError("current record doesn't have 'Content-Length' header")
+        block = WarcBlock(self, headers, self.current_pos, version, lower)
+        if len(block.header_all("Content-Length")) > 1:
+            raise InvalidWarcError("duplicate Content-Length")
+        self._prev_body_end = self.current_pos + block.content_length
+        return block
 
-        self.next_block = self.current_pos + int(headers_dict["Content-Length"][0]) + 4
-        return WarcBlock(self, headers_dict, self.current_pos)
-
-    def skip_to(self, at):
+    def skip_to(self, at: int) -> None:
         if at == self.current_pos:
             return
         if at < self.current_pos:
             raise NotSeekableError("file not seekable (you can't read previous blocks once readed/skipped)")
-        
-        skip_nbytes = at - self.current_pos
 
-        while skip_nbytes > 0:
-            self.fp.read(MAX_SKIPBUF if skip_nbytes > MAX_SKIPBUF else skip_nbytes)
-            skip_nbytes -= MAX_SKIPBUF
-        
-        self.current_pos = at
+        while self.current_pos < at:
+            chunk = self.fp.read(min(MAX_SKIPBUF, at - self.current_pos))
+            if not chunk:
+                raise TruncatedWarcError("input ended while skipping a record body")
+            self.current_pos += len(chunk)
 
-    def read_at(self, nread, at):
+    def _read_n(self, nread: int) -> bytes:
+        chunks = []
+        got = 0
+        while got < nread:
+            chunk = self.fp.read(nread - got)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            got += len(chunk)
+        return chunks[0] if len(chunks) == 1 else b"".join(chunks)
+
+    def read_at(self, nread: int, at: int) -> bytes:
         if self.is_seekable:
             self.fp.seek(at)
-            ret = self.fp.read(nread)
-            self.fp.seek(self.current_pos)
-            return ret
+            try:
+                return self._read_n(nread)
+            finally:
+                self.fp.seek(self.current_pos)
         else:
             self.skip_to(at)
-            ret = self.fp.read(nread)
+            ret = self._read_n(nread)
             self.current_pos = len(ret) + at
             return ret
 
-    # Magic Methods
+    def close(self) -> None:
+        """Close the gzip wrapper and the file opened from a path (idempotent)."""
+        gz = getattr(self, "_gzip_fp", None)
+        if gz is not None:
+            self._gzip_fp = None
+            gz.close()
+        raw = getattr(self, "_raw_fp", None)
+        if raw is not None:
+            self._raw_fp = None
+            raw.close()
 
-    def __next__(self):
+    # Magic Methods
+
+    def __next__(self) -> WarcBlock:
         ret = self.get_next_block()
         if ret is None:
             raise StopIteration
         return ret
 
-    def __iter__(self):
+    def __iter__(self) -> "WarcReader":
         return self
 
-    def __del__(self):
-        if self.is_fp_self_managed and self.fp is not None:
-            self.fp.close()
+    def __enter__(self) -> "WarcReader":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        try:
+            if getattr(self, "is_fp_self_managed", False):
+                self.close()
+        except Exception:
+            pass
+
+
+def parse_record(data: bytes, *, max_header_bytes: int = DEFAULT_MAX_HEADER_BYTES,
+                 max_headers: int = DEFAULT_MAX_HEADERS) -> WarcBlock:
+    """Parse exactly one (uncompressed) WARC record from `data`.
+
+    Raises InvalidWarcError on malformed input ("empty input" on b"",
+    "trailing data" if bytes follow the trailer) and TruncatedWarcError if
+    the record is incomplete. The block reads from an internal BytesIO.
+    For streams, use `WarcReader(stream).get_next_block()` and `block.read(n)`.
+    """
+    reader = WarcReader(BytesIO(data), compressed=False,
+                        max_header_bytes=max_header_bytes, max_headers=max_headers)
+    block = reader.get_next_block()
+    if block is None:
+        raise InvalidWarcError("empty input")
+    end = block.block_content_pos + block.content_length
+    tail = bytes(data[end:end + 5])
+    if len(tail) < 4:
+        raise TruncatedWarcError("record is truncated")
+    if tail[:4] != _TRAILER:
+        raise InvalidWarcError("missing record trailer")
+    if len(tail) > 4:
+        raise InvalidWarcError("trailing data")
+    return block
