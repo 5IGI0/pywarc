@@ -162,6 +162,27 @@ cannot be given in `record_headers`.
 python3 -m unittest   # from the repository root
 ```
 
+Byte-exact re-send (keeps `WARC/1.0`, odd spacing, folded lines): `blk.raw_head` is
+the record head exactly as read, and `blk.iter_raw(chunk_size=65536)` yields
+`raw_head`, the body in chunks, then the canonical `\r\n\r\n` trailer (the record's
+real trailer is validated by the next `get_next_block()`). It re-reads the body from
+its start: on a non-seekable input it raises `NotSeekableError` if the body was
+already partly read.
+
+Performance: sequential reads are linear on seekable and non-seekable inputs,
+and unread bodies of a plain seekable file are skipped with one `seek`. On a `.gz`
+input, reading an earlier block re-decompresses from the start; read bodies in
+order for linear time (this includes `iter_raw`, or `read(n)` after a partial read
+on an earlier block: each such chunk re-decompresses from the start).
+A cut or corrupted gzip member raises `TruncatedWarcError` / `InvalidWarcError`
+(the original exception is the `__cause__`).
+
+## Changes in 0.4.1
+
+- New `WarcBlock.raw_head` and `WarcBlock.iter_raw()` (byte-exact re-emit).
+- Fixed quadratic time when reading bodies of a seekable gzip input (no more seek
+  per `read()`), and skipping unread bodies of a plain seekable file is O(1).
+
 ## Changes in 0.4.0
 
 New: `parse_record`, `serialize_record`, `serialize_record_head`,

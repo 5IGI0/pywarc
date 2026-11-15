@@ -108,6 +108,40 @@ def ReaderTester(name, compressor, compressed):
             with self.assertRaises(InvalidWarcError):
                 self.first(b"HTTP/1.1")
 
+        def test_raw_head_exact(self):
+            head = (b"WARC/1.1\r\nwarc-type:x\r\nA:   1  \r\nB: x\r\n\ty\r\nA: 2\r\n"
+                    b"Content-Length: 3\r\n\r\n")
+            blk = self.first(head + b"abc\r\n\r\n")
+            self.assertEqual(blk.raw_head, head)
+            self.assertEqual(blk.headers["A"], ["1", "2"])
+            self.assertEqual(blk.header("B"), "x y")
+            self.assertEqual(blk.type, "x")
+
+        def test_reemit_warc_1_0(self):
+            r1 = (b"WARC/1.0\r\nwarc-type:resource\r\nWARC-Target-URI:   http://e.x/ \r\n"
+                  b"X: a\r\n  b\r\ncontent-length:5\r\n\r\nhello\r\n\r\n")
+            r2 = b"WARC/1.0\r\nWARC-Type: metadata\r\nContent-Length: 0\r\n\r\n\r\n\r\n"
+            body = b"\r\n\r\nWARC/1.0\r\n"
+            r3 = (b"WARC/1.0\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body + b"\r\n\r\n")
+            data = r1 + r2 + r3
+            reader = WarcReader(BytesIO(compressor(data)), compressed=compressed)
+            out = b"".join(chunk for blk in reader for chunk in blk.iter_raw(chunk_size=5))
+            self.assertEqual(out, data)
+
+        def test_iter_raw_after_partial_read(self):
+            data = self.rec(b"A: 1\r\n", body=b"abcdefgh")
+            blk = self.first(data)
+            self.assertEqual(blk.read(3), b"abc")
+            self.assertEqual(b"".join(blk.iter_raw()), data)
+
+        def test_iter_raw_args(self):
+            blk = self.first(self.rec())
+            with self.assertRaises(ValueError):
+                blk.iter_raw(chunk_size=0)
+            blk.raw_head = None
+            with self.assertRaises(ValueError):
+                blk.iter_raw()
+
         def test_case_insensitive(self):
             blk = self.first(b"WARC/1.1\r\nwarc-type: x\r\ncontent-length: 4\r\n\r\nAAAA\r\n\r\n")
             self.assertEqual(blk.type, "x")
@@ -352,9 +386,171 @@ def NonSeekableReaderTester(name, compressed):
             r.get_next_block()
             self.assertEqual(r.get_next_block().read(), bodies[0])
 
+        def test_iter_raw_streaming(self):
+            data, bodies = self._plain_data()
+            r = WarcReader(ShortReadStream(data), compressed=False)
+            out = b"".join(c for blk in r for c in blk.iter_raw(chunk_size=50))
+            self.assertEqual(out, data)
+            r = WarcReader(ShortReadStream(data), compressed=False)
+            r.get_next_block()
+            blk = r.get_next_block()
+            blk.read(10)
+            with self.assertRaises(NotSeekableError):
+                list(blk.iter_raw())
+
+        def test_iter_raw_partial_read_fails_early(self):
+            data, _ = self._plain_data()
+            r = WarcReader(ShortReadStream(data), compressed=False)
+            r.get_next_block()
+            blk = r.get_next_block()
+            blk.read(10)
+            gen = None
+            with self.assertRaises(NotSeekableError):
+                gen = blk.iter_raw()  # raises at call time, nothing yielded
+            self.assertIsNone(gen)
+
     NonSeekableReaderTester.__name__ = name
     NonSeekableReaderTester.__qualname__ = name
     return NonSeekableReaderTester
 
 GzipNonSeekableReaderTester = NonSeekableReaderTester("GzipNonSeekableReaderTester", True)
 NonSeekableReaderTester = NonSeekableReaderTester("NonSeekableReaderTester", False)
+
+
+class CountingBytesIO(BytesIO):
+    """BytesIO that counts bytes handed out and seek calls."""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.bytes_read = 0
+        self.seeks = 0
+
+    def read(self, *args, **kwargs):
+        ret = super().read(*args, **kwargs)
+        self.bytes_read += len(ret)
+        return ret
+
+    def read1(self, *args, **kwargs):
+        ret = super().read1(*args, **kwargs)
+        self.bytes_read += len(ret)
+        return ret
+
+    def readinto(self, b):
+        n = super().readinto(b)
+        self.bytes_read += n
+        return n
+
+    def seek(self, *args, **kwargs):
+        self.seeks += 1
+        return super().seek(*args, **kwargs)
+
+
+class GzipLinearReadTester(unittest.TestCase):
+    N = 200
+
+    @classmethod
+    def setUpClass(cls):
+        buf = BytesIO()
+        w = WarcWriter(buf, compress=True)
+        cls.bodies = [os.urandom(20000) for _ in range(cls.N)]
+        for b in cls.bodies:
+            w.write_block("resource", b)
+        cls.data = buf.getvalue()
+
+    def _reader(self):
+        raw = CountingBytesIO(self.data)
+        reader = WarcReader(raw, compressed=True)
+        calls = []
+        orig = reader.fp.seek
+        def counting_seek(*a, **k):
+            calls.append(a)
+            return orig(*a, **k)
+        reader.fp.seek = counting_seek
+        return raw, reader, calls
+
+    def test_sequential_read_is_linear(self):
+        raw, reader, calls = self._reader()
+        reader.get_next_block()  # warcinfo
+        for expected in self.bodies:
+            blk = reader.get_next_block()
+            out = []
+            while True:
+                chunk = blk.read(4096)
+                if not chunk:
+                    break
+                out.append(chunk)
+            self.assertEqual(b"".join(out), expected)
+        self.assertIsNone(reader.get_next_block())
+        self.assertLessEqual(raw.bytes_read, len(self.data) + 256 * 1024)
+        self.assertEqual(calls, [])
+
+    def test_get_as_stream_is_linear(self):
+        raw, reader, calls = self._reader()
+        reader.get_next_block()
+        for expected in self.bodies:
+            self.assertEqual(reader.get_next_block().get_as_stream().read(), expected)
+        self.assertLessEqual(raw.bytes_read, len(self.data) + 256 * 1024)
+        self.assertEqual(calls, [])
+
+
+class PlainSkipTester(unittest.TestCase):
+    def _data(self, n=50):
+        buf = BytesIO()
+        w = WarcWriter(buf, compress=False)
+        bodies = [bytes([i]) * 100000 for i in range(n)]
+        for b in bodies:
+            w.write_block("resource", b)
+        return buf.getvalue(), bodies
+
+    def test_skip_uses_seek(self):
+        data, bodies = self._data()
+        raw = CountingBytesIO(data)
+        reader = WarcReader(raw, compressed=False)
+        last = None
+        for blk in reader:
+            last = blk
+        self.assertLess(raw.bytes_read, len(data) // 10)
+        self.assertEqual(last.type, "resource")
+        self.assertEqual(last.content_length, 100000)
+        self.assertEqual(last.read(), bodies[-1])
+
+    def test_truncated_last_body(self):
+        data, _ = self._data(3)
+        reader = WarcReader(BytesIO(data[:-50000]), compressed=False)
+        for _ in range(4):  # warcinfo + 3 records, the last one cut
+            reader.get_next_block()
+        with self.assertRaises(TruncatedWarcError):
+            reader.get_next_block()
+
+
+class GzipDamagedTester(unittest.TestCase):
+    def _gz(self):
+        buf = BytesIO()
+        w = WarcWriter(buf, compress=True)
+        body = os.urandom(5000)
+        w.write_block("resource", body)
+        return buf.getvalue(), body
+
+    def test_cut_member(self):
+        data, body = self._gz()
+        cut = data[:-100]
+        reader = WarcReader(BytesIO(cut), compressed=True)
+        reader.get_next_block()
+        blk = reader.get_next_block()
+        with self.assertRaises(TruncatedWarcError) as cm:
+            blk.read()
+        self.assertIsInstance(cm.exception.__cause__, EOFError)
+        # position stays consistent with what was really read
+        self.assertLessEqual(reader.current_pos, blk.block_content_pos + blk.content_length)
+        # cut inside the head of the record
+        reader = WarcReader(BytesIO(data[:60]), compressed=True)
+        with self.assertRaises(TruncatedWarcError):
+            reader.get_next_block()
+
+    def test_corrupted_member(self):
+        data, body = self._gz()
+        bad = bytearray(data)
+        bad[len(bad) // 2] ^= 0xFF
+        reader = WarcReader(BytesIO(bytes(bad)), compressed=True)
+        with self.assertRaises(InvalidWarcError):
+            for blk in reader:
+                blk.read()

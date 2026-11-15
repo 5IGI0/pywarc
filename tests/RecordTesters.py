@@ -86,6 +86,10 @@ class RecordTester(unittest.TestCase):
         self.assertEqual(blk.read(), b"abc")
         self.assertEqual(blk.read(), b"")
 
+    def test_parse_record_raw_head(self):
+        data = serialize_record("resource", b"abc", record_id="urn:x:1", record_date=FIXED_DATE)
+        self.assertEqual(parse_record(data).raw_head, data[:data.index(b"\r\n\r\n") + 4])
+
     def test_masstuffy_conformance(self):
         cases = [
             dict(content=b""),

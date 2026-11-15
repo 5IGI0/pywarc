@@ -15,5 +15,5 @@
 # If not, see <https://www.gnu.org/licenses/>. 
 
 from .WriterTesters import SeekableWriterTester, NotSeekableWriterTester, WriterTester, CompressedSeekableWriteTester, CompressedNonSeekableWriteTester
-from .ReaderTesters import ReaderTester, SeekableReaderTester, NonSeekableReaderTester, GzipReaderTester, GzipSeekableReaderTester, GzipNonSeekableReaderTester
+from .ReaderTesters import ReaderTester, SeekableReaderTester, NonSeekableReaderTester, GzipReaderTester, GzipSeekableReaderTester, GzipNonSeekableReaderTester, GzipLinearReadTester, PlainSkipTester, GzipDamagedTester
 from .RecordTesters import RecordTester

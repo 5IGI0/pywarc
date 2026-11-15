@@ -17,9 +17,10 @@
 from __future__ import annotations
 
 import gzip
+import zlib
 from datetime import datetime
 from io import BytesIO
-from typing import IO, Callable, Dict, List, Optional, Union
+from typing import IO, Callable, Dict, Iterator, List, Optional, Union
 
 from ._headers import is_token, parse_content_length, parse_warc_date, strip_brackets
 from .errors import (  # noqa: F401  (re-exported for backward compatibility)
@@ -36,6 +37,9 @@ DEFAULT_MAX_HEADERS = 1024
 
 _VERSIONS = {b"WARC/1.0\r\n": "WARC/1.0", b"WARC/1.1\r\n": "WARC/1.1"}
 _TRAILER = b"\r\n\r\n"
+# errors raised by GzipFile on corrupted compressed data (BadGzipFile: 3.8+,
+# earlier versions raise OSError which cannot be told from real I/O errors)
+_GZIP_CORRUPT = (zlib.error,) + ((gzip.BadGzipFile,) if hasattr(gzip, "BadGzipFile") else ())
 
 
 def _url_header_sanitizer(header: str) -> str:
@@ -67,12 +71,14 @@ class WarcBlock(object):
 
     def __init__(self, warc_reader: "WarcReader", headers: Dict[str, List[str]],
                  block_content_pos: int, version: str = "WARC/1.1",
-                 lower: Optional[Dict[str, List[str]]] = None) -> None:
+                 lower: Optional[Dict[str, List[str]]] = None,
+                 raw_head: Optional[bytes] = None) -> None:
         self.warc_reader = warc_reader
         self.block_content_pos = block_content_pos
         self.read_offset = 0
         self.headers = headers
         self.version = version
+        self.raw_head = raw_head  # head bytes exactly as read (version line .. blank line)
         if lower is None:
             lower = {}
             for k, vs in headers.items():
@@ -107,6 +113,37 @@ class WarcBlock(object):
         if len(ret) < nread:
             raise TruncatedWarcError("record body is truncated")
         return ret
+
+    def iter_raw(self, chunk_size: int = 64 * 1024) -> Iterator[bytes]:
+        """Yield the record byte-exactly as read: raw_head, the body in chunks
+        of at most `chunk_size`, then b"\\r\\n\\r\\n".
+
+        Re-reads the body from its start (resets read_offset to 0): on a
+        non-seekable input this raises NotSeekableError if the body was already
+        partly read or the reader moved past it. Raises ValueError (at call
+        time) if raw_head is None or chunk_size < 1, and TruncatedWarcError if
+        the body is cut. The trailer is the canonical one; the actual trailer
+        of this record is validated by the next get_next_block() call.
+        """
+        if self.raw_head is None:
+            raise ValueError("raw_head is not available for this block")
+        if chunk_size < 1:
+            raise ValueError("chunk_size must be >= 1")
+        reader = self.warc_reader
+        if not reader.is_seekable and reader.current_pos != self.block_content_pos:
+            # fail before anything is yielded: never emit a lone head
+            raise NotSeekableError("body already partly read on a non-seekable input")
+        return self._iter_raw(chunk_size)
+
+    def _iter_raw(self, chunk_size: int) -> Iterator[bytes]:
+        self.read_offset = 0
+        yield self.raw_head
+        while True:
+            chunk = self.read(chunk_size)
+            if not chunk:
+                break
+            yield chunk
+        yield _TRAILER
 
     def get_as_stream(self) -> BytesIO:
         """The whole body as a BytesIO (slurps the body)."""
@@ -171,22 +208,37 @@ class WarcReader(object):
 
     # internal I/O (all of them keep current_pos in sync with the stream)
 
+    def _fp_call(self, name: str, *args):
+        """Call fp.<name>, mapping gzip failures to pywarc errors."""
+        try:
+            return getattr(self.fp, name)(*args)
+        except EOFError as e:  # GzipFile: compressed member cut
+            raise TruncatedWarcError("compressed input is truncated") from e
+        except _GZIP_CORRUPT as e:
+            raise InvalidWarcError(f"corrupted compressed input: {e}") from e
+
     def _readline(self, limit: int) -> bytes:
-        line = self.fp.readline(limit)
+        line = self._fp_call("readline", limit)
         self.current_pos += len(line)
         return line
 
-    def _read_exact(self, n: int) -> bytes:
+    def _read_n(self, nread: int, advance: bool = False) -> bytes:
+        """Read up to nread bytes (short only at EOF). With `advance`,
+        current_pos follows every chunk actually read, even if a later read raises."""
         chunks = []
         got = 0
-        while got < n:
-            chunk = self.fp.read(n - got)
+        while got < nread:
+            chunk = self._fp_call("read", nread - got)
             if not chunk:
                 break
             chunks.append(chunk)
             got += len(chunk)
-        self.current_pos += got
+            if advance:
+                self.current_pos += len(chunk)
         return chunks[0] if len(chunks) == 1 else b"".join(chunks)
+
+    def _read_exact(self, n: int) -> bytes:
+        return self._read_n(n, True)
 
     def get_next_block(self) -> Optional[WarcBlock]:
         """Return the next record, or None at a clean end of input.
@@ -212,6 +264,7 @@ class WarcReader(object):
             raise InvalidWarcError(f"invalid WARC header: {line[:64]!r}")
         version = _VERSIONS[line]
         used = len(line)
+        head_parts = [line]
 
         entries: List[List[bytes]] = []
         while True:
@@ -220,6 +273,7 @@ class WarcReader(object):
             if len(line) > remaining:
                 raise InvalidWarcError("header section too large")
             used += len(line)
+            head_parts.append(line)
             if not line.endswith(b"\n"):
                 raise TruncatedWarcError("record head is truncated")
             if not line.endswith(b"\r\n"):
@@ -257,7 +311,7 @@ class WarcReader(object):
             headers.setdefault(name, []).append(value)
             lower.setdefault(name.lower(), []).append(value)
 
-        block = WarcBlock(self, headers, self.current_pos, version, lower)
+        block = WarcBlock(self, headers, self.current_pos, version, lower, b"".join(head_parts))
         if len(block.header_all("Content-Length")) > 1:
             raise InvalidWarcError("duplicate Content-Length")
         self._prev_body_end = self.current_pos + block.content_length
@@ -269,35 +323,34 @@ class WarcReader(object):
         if at < self.current_pos:
             raise NotSeekableError("file not seekable (you can't read previous blocks once readed/skipped)")
 
+        if self.is_seekable and self._gzip_fp is None:
+            # plain seekable file: O(1) skip; a short file is detected by the
+            # trailer read that follows
+            self._fp_call("seek", at)
+            self.current_pos = at
+            return
+
         while self.current_pos < at:
-            chunk = self.fp.read(min(MAX_SKIPBUF, at - self.current_pos))
+            chunk = self._fp_call("read", min(MAX_SKIPBUF, at - self.current_pos))
             if not chunk:
                 raise TruncatedWarcError("input ended while skipping a record body")
             self.current_pos += len(chunk)
 
-    def _read_n(self, nread: int) -> bytes:
-        chunks = []
-        got = 0
-        while got < nread:
-            chunk = self.fp.read(nread - got)
-            if not chunk:
-                break
-            chunks.append(chunk)
-            got += len(chunk)
-        return chunks[0] if len(chunks) == 1 else b"".join(chunks)
-
     def read_at(self, nread: int, at: int) -> bytes:
-        if self.is_seekable:
-            self.fp.seek(at)
-            try:
-                return self._read_n(nread)
-            finally:
-                self.fp.seek(self.current_pos)
-        else:
-            self.skip_to(at)
-            ret = self._read_n(nread)
-            self.current_pos = len(ret) + at
-            return ret
+        if at != self.current_pos:
+            if not self.is_seekable or (self._gzip_fp is not None and at > self.current_pos):
+                # forward-only: never seek (raises NotSeekableError going back
+                # on a non-seekable input)
+                self.skip_to(at)
+            else:
+                # random access to an earlier block (on gzip this rewinds and
+                # re-decompresses from the start)
+                self._fp_call("seek", at)
+                try:
+                    return self._read_n(nread)
+                finally:
+                    self._fp_call("seek", self.current_pos)
+        return self._read_n(nread, True)
 
     def close(self) -> None:
         """Close the gzip wrapper and the file opened from a path (idempotent)."""
