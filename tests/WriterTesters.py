@@ -19,8 +19,10 @@ import tempfile
 import shutil
 import re
 import os
+import gc
 
-from datetime import datetime
+from io import BytesIO
+from datetime import datetime, timezone
 from pywarc import WarcReader, WarcWriter, CurrentBlockOverflowError, PreviousBlockNotTerminatedError
 from random import choices, randint
 from .utils import patch_BytesIo
@@ -64,6 +66,33 @@ class WriterTester(unittest.TestCase):
         reader = WarcReader(path)
         for _ in reader:
             pass
+
+    def test_gc_does_not_close_user_fp(self):
+        f = BytesIO()
+        w = WarcWriter(f, compress=True)
+        w.write_block("resource", b"hello")
+        del w
+        gc.collect()
+        self.assertFalse(f.closed)
+        f.seek(0)
+        blocks = list(WarcReader(f, compressed=True))
+        self.assertEqual([b.type for b in blocks], ["warcinfo", "resource"])
+        self.assertEqual(blocks[1].read(), b"hello")
+
+    def test_context_manager(self):
+        for name in ("ctx.warc", "ctx.warc.gz"):
+            with self.subTest(name=name):
+                path = self.temp_dir + "/" + name
+                with WarcWriter(path, truncate=True) as w:
+                    w.write_block("resource", b"abc")
+                raw = w.fp.sub_fp if name.endswith(".gz") else w.fp
+                self.assertTrue(raw.closed)
+                with WarcReader(path) as r:
+                    self.assertEqual(r.get_next_block().type, "warcinfo")
+                    self.assertEqual(r.get_next_block().read(), b"abc")
+                self.assertTrue(r.fp.closed)
+                if name.endswith(".gz"):
+                    self.assertTrue(r._raw_fp is None)
 
 def gen_tester(name, PatchedBytesIO, compress):
     class WriterTester(unittest.TestCase):
@@ -206,6 +235,45 @@ def gen_tester(name, PatchedBytesIO, compress):
             self.validate_warc(underlying_fp)
             underlying_fp.force_seek(0) # do not use it in your code to bypass the tests.
             self.check_content(underlying_fp)
+
+        def test_write_warcinfo_false(self):
+            fp = PatchedBytesIO(b"")
+            writer = WarcWriter(fp, write_warcinfo=False, compress=self.compress)
+            self.assertIsNone(writer.warc_info_id)
+            writer.write_block("resource", b"abc")
+            fp.force_seek(0)
+            blk = WarcReader(fp, compressed=self.compress).get_next_block()
+            self.assertEqual(blk.type, "resource")
+            self.assertNotIn("WARC-Warcinfo-ID", blk.headers)
+            self.assertIsNone(blk.warcinfo_id)
+            self.assertEqual(blk.read(), b"abc")
+
+        def test_aware_record_date(self):
+            fp = PatchedBytesIO(b"")
+            writer = WarcWriter(fp, compress=self.compress)
+            writer.write_block("resource", b"abc", record_date=datetime.now(timezone.utc))
+            fp.force_seek(0)
+            blocks = list(WarcReader(fp, compressed=self.compress))
+            raw = blocks[1].header("WARC-Date")
+            self.assertTrue(raw.endswith("Z"))
+            self.assertNotIn("+00:00", raw)
+            self.assertIsNotNone(blocks[1].date)
+
+        def test_validation_writes_nothing(self):
+            fp = PatchedBytesIO(b"")
+            writer = WarcWriter(fp, compress=self.compress)
+            before = len(fp.getvalue())
+            for kwargs in ({"record_headers": {"X": "a\r\nY: b"}}, {"record_id": "nocolon"},
+                           {"record_headers": {"Content-Length": "1"}}):
+                with self.assertRaises(ValueError):
+                    writer.start_block("resource", 3, **kwargs)
+            with self.assertRaises(ValueError):
+                writer.start_block("bad type", 3)
+            self.assertEqual(len(fp.getvalue()), before)
+            self.assertEqual(writer.body_remaining_length, 0)
+            writer.write_block("resource", b"ok")
+            fp.force_seek(0)
+            self.assertEqual([b.type for b in WarcReader(fp, compressed=self.compress)], ["warcinfo", "resource"])
 
         def test_overflow_and_not_terminated(self):
             underlying_fp = PatchedBytesIO(b"")

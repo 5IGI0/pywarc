@@ -14,6 +14,8 @@
 # You should have received a copy of the GNU Lesser General Public License along with PyWarc.
 # If not, see <https://www.gnu.org/licenses/>. 
 
+from __future__ import annotations
+
 import gzip
 
 def MakeFakeTellable(obj):
@@ -83,6 +85,3 @@ class SeekableGZipWriter(object):
             self.end_part()
         
         self.sub_fp.close()
-    
-    def __del__(self):
-        self.close()
