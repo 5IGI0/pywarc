@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pywarc"
+dynamic = ["version"]
+description = "WARC file format library"
+readme = "README.md"
+requires-python = ">=3.7"
+license = "LGPL-3.0-or-later"
+license-files = ["LICENSE", "LICENSE.LESSER"]
+authors = [{ name = "5IGI0", email = "5IGI0@protonmail.com" }]
+dependencies = []
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+]
+
+[project.urls]
+Homepage = "https://github.com/5IGI0/pywarc"
+
+[tool.setuptools]
+packages = ["pywarc"]
+
+[tool.setuptools.dynamic]
+version = { attr = "pywarc.constants.PY_WARC_VERSION" }
