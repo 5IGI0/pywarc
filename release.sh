@@ -1,9 +1,15 @@
 #!/bin/sh
+set -eu
 
-virtualenv -p python3 .venv3
+cd "$(dirname "$0")"
+
+[ -d .venv3 ] || virtualenv -p python3 .venv3
 . .venv3/bin/activate
 
-rm -rf build/ dist/
-python setup.py bdist_wheel
+python -m pip install --upgrade pip build twine
 
+rm -rf build/ dist/ *.egg-info
+python -m build
+
+twine check dist/*
 twine upload dist/*
